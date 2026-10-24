@@ -21,7 +21,7 @@ const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(
   "\n"
 );
 
-const SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const SYNC_INTERVAL_MS = 60 * 1000;
 
 const REQUIRED_ENV = [
   "SHOPIFY_STORE",
