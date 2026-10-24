@@ -1,13 +1,14 @@
 
 import express from "express";
 import crypto from "node:crypto";
-import dotenv from "dotenv";
 import { google } from "googleapis";
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ============================================================
+// RENDER ENVIRONMENT VARIABLES
+// ============================================================
 
 const REQUIRED_ENV = [
   "SHOPIFY_WEBHOOK_SECRET",
@@ -18,7 +19,7 @@ const REQUIRED_ENV = [
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
-    throw new Error(`Missing required environment variable: ${key}`);
+    throw new Error(`Missing required Render environment variable: ${key}`);
   }
 }
 
@@ -37,7 +38,10 @@ const sheets = google.sheets({ version: "v4", auth });
 const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
 
-// Shopify requires the original raw request body for signature verification.
+// ============================================================
+// SHOPIFY FULFILLED ORDER WEBHOOK
+// ============================================================
+
 app.post(
   "/webhooks/orders-fulfilled",
   express.raw({ type: "application/json" }),
@@ -77,8 +81,7 @@ app.post(
     }
 
     try {
-      // Only record orders that are fully fulfilled.
-      // Ignore partial fulfillments.
+      // Only process fully fulfilled orders.
       if (order.fulfillment_status !== "fulfilled") {
         console.log(`Order ${order.name} is not fully fulfilled; skipped.`);
         return res.status(200).send("Not fully fulfilled; skipped");
@@ -88,7 +91,7 @@ app.post(
         throw new Error("Webhook is missing required order information");
       }
 
-      // Use the most recent fulfillment timestamp when available.
+      // Get the latest fulfillment timestamp when available.
       const fulfillments = Array.isArray(order.fulfillments)
         ? order.fulfillments
         : [];
@@ -100,7 +103,9 @@ app.post(
         .filter((date) => !Number.isNaN(date.getTime()));
 
       const latestFulfillment = fulfillmentDates.length
-        ? new Date(Math.max(...fulfillmentDates.map((date) => date.getTime())))
+        ? new Date(
+            Math.max(...fulfillmentDates.map((date) => date.getTime()))
+          )
         : null;
 
       const fulfillmentDate = (
@@ -112,7 +117,7 @@ app.post(
         year: "numeric",
       });
 
-      // Check existing order numbers in column B.
+      // Check existing order numbers in column B to avoid duplicates.
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: `${SHEET_TAB}!B:B`,
@@ -127,17 +132,14 @@ app.post(
         return res.status(200).send("Order already recorded");
       }
 
-      // Convert to cents to avoid floating-point rounding errors.
+      // Entire order total, including discounts, shipping, and taxes.
       const priceCents = Math.round(Number(order.total_price) * 100);
 
-      if (!Number.isFinite(priceCents) || priceCents < 0) {
+      if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
         throw new Error("Invalid order total");
       }
 
-      const commissionCents = Math.round(priceCents * 0.10);
-
-      const price = priceCents / 100;
-      const tenPercent = commissionCents / 100;
+      const tenPercentCents = Math.round(priceCents * 0.10);
 
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
@@ -149,26 +151,29 @@ app.post(
             fulfillmentDate,
             order.name,
             "wonder portal",
-            price,
-            tenPercent,
+            priceCents / 100,
+            tenPercentCents / 100,
           ]],
         },
       });
 
       console.log(
-        `Recorded order ${order.name}: $${price.toFixed(2)}, ` +
-        `10% = $${tenPercent.toFixed(2)}`
+        `Recorded order ${order.name}: ` +
+        `$${(priceCents / 100).toFixed(2)}, ` +
+        `10% = $${(tenPercentCents / 100).toFixed(2)}`
       );
 
       return res.status(200).send("Order recorded");
     } catch (error) {
       console.error("Failed to record Shopify order:", error);
-
-      // A non-200 response lets Shopify retry the webhook.
       return res.status(500).send("Failed to record order");
     }
   }
 );
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
 
 app.get("/", (req, res) => {
   res.status(200).send("Wonder Portal order logger is running.");
