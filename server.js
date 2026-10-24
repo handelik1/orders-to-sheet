@@ -18,14 +18,12 @@ const GOOGLE_SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
 const GOOGLE_SERVICE_ACCOUNT_EMAIL =
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY =
-  process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+  process.env.GOOGLE_PRIVATE_KEY
+    ?.replace(/^["']|["']$/g, "")
+    .replace(/\\n/g, "\n");
 
 const SYNC_INTERVAL_MS = 60 * 1000;
-const REQUEST_TIMEOUT_MS = 30000;
-
-// Limit the number of pages fetched in a single cycle to avoid
-// an excessively long sync. The next cycle will continue checking.
-const MAX_PAGES_PER_SYNC = 20;
+const REQUEST_TIMEOUT_MS = 20000;
 
 const REQUIRED_ENV = [
   "SHOPIFY_STORE",
@@ -63,78 +61,38 @@ const SHEET_RANGE = `'${escapedTab}'!A:E`;
 const ORDER_NUMBER_RANGE = `'${escapedTab}'!B:B`;
 
 // ============================================================
-// SHOPIFY PAGINATION
+// FETCH ONLY SHOPIFY PAGE 1
 // ============================================================
 
-async function fetchAllOrders() {
-  const orders = [];
-  const seenUrls = new Set();
-
-  let nextUrl =
+async function fetchFirstPageOrders() {
+  const url =
     `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders.json` +
-    "?status=any&limit=250&order=updated_at%20asc";
+    "?status=any&limit=250&order=updated_at%20desc";
 
-  let pageCount = 0;
-  let reachedEnd = false;
+  console.log("Fetching Shopify order page 1 only...");
 
-  while (nextUrl && pageCount < MAX_PAGES_PER_SYNC) {
-    if (seenUrls.has(nextUrl)) {
-      throw new Error(
-        "Shopify returned a repeated pagination URL. Stopping to prevent an infinite loop."
-      );
-    }
+  const response = await fetch(url, {
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
 
-    seenUrls.add(nextUrl);
-    pageCount++;
+  console.log(`Shopify responded with status ${response.status}`);
 
-    console.log(`Fetching Shopify order page ${pageCount}...`);
-
-    const response = await fetch(nextUrl, {
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-
-    console.log(`Shopify responded with status ${response.status}`);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
-        `Shopify API error ${response.status}: ${errorText}`
-      );
-    }
-
-    const data = await response.json();
-    const pageOrders = data.orders || [];
-
-    console.log(`Retrieved ${pageOrders.length} order(s).`);
-    orders.push(...pageOrders);
-
-    const linkHeader = response.headers.get("link");
-    const nextMatch = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
-
-    nextUrl = nextMatch ? nextMatch[1] : null;
-
-    if (!nextUrl) {
-      reachedEnd = true;
-    }
-
-    // Shopify's cursor is contained in the rel="next" URL.
-  }
-
-  console.log(
-    `Retrieved ${orders.length} order(s) across ${pageCount} page(s).`
-  );
-
-  if (!reachedEnd && nextUrl) {
-    console.log(
-      `Page limit reached. More orders remain; the next sync will continue from the beginning.`
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Shopify API error ${response.status}: ${errorText}`
     );
   }
 
-  return { orders, reachedEnd };
+  const data = await response.json();
+  const orders = data.orders || [];
+
+  console.log(`Retrieved ${orders.length} order(s) from page 1.`);
+  return orders;
 }
 
 // ============================================================
@@ -142,14 +100,12 @@ async function fetchAllOrders() {
 // ============================================================
 
 function getFulfillmentDate(order) {
-  const fulfillmentDates = (order.fulfillments || [])
+  const dates = (order.fulfillments || [])
     .map((fulfillment) => new Date(fulfillment.created_at))
     .filter((date) => !Number.isNaN(date.getTime()));
 
-  const date = fulfillmentDates.length
-    ? new Date(
-        Math.max(...fulfillmentDates.map((item) => item.getTime()))
-      )
+  const date = dates.length
+    ? new Date(Math.max(...dates.map((item) => item.getTime())))
     : new Date(order.updated_at || order.created_at);
 
   return date.toLocaleDateString("en-US", {
@@ -161,13 +117,14 @@ function getFulfillmentDate(order) {
 }
 
 // ============================================================
-// SYNC
+// SYNC ORDERS
 // ============================================================
 
 async function syncOrders() {
   console.log("Starting Shopify order sync:", new Date().toISOString());
 
-  // Read existing order numbers first.
+  const orders = await fetchFirstPageOrders();
+
   console.log("Reading existing order numbers from Google Sheets...");
 
   const existingResponse = await sheets.spreadsheets.values.get(
@@ -190,14 +147,6 @@ async function syncOrders() {
   console.log(
     `Google Sheets connected. Existing order numbers: ${existingOrderNumbers.size}`
   );
-
-  const { orders, reachedEnd } = await fetchAllOrders();
-
-  if (!reachedEnd) {
-    console.warn(
-      "This sync did not reach the end of Shopify history. Only processing orders retrieved in this batch."
-    );
-  }
 
   const rows = [];
 
@@ -230,7 +179,7 @@ async function syncOrders() {
       tenPercentCents / 100,
     ]);
 
-    // Ensure an order can only be added once in this batch.
+    // Avoid duplicate order numbers within this run.
     existingOrderNumbers.add(orderNumber);
   }
 
@@ -241,7 +190,7 @@ async function syncOrders() {
     return;
   }
 
-  console.log("Appending new orders to Google Sheets...");
+  console.log("Appending rows to Google Sheets...");
 
   await sheets.spreadsheets.values.append(
     {
@@ -259,12 +208,12 @@ async function syncOrders() {
   );
 
   console.log(
-    `Successfully added ${rows.length} new order(s) to Google Sheets.`
+    `Successfully added ${rows.length} order(s) to Google Sheets.`
   );
 }
 
 // ============================================================
-// SAFE LOOP
+// SAFE SYNC LOOP
 // ============================================================
 
 let syncInProgress = false;
