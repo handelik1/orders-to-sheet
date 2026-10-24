@@ -176,9 +176,11 @@ app.post(
 // ============================================================
 
 app.get("/", (req, res) => {
+  console.log("Health check received:", new Date().toISOString());
   res.status(200).send("Wonder Portal order logger is running.");
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.post("/webhooks/orders-fulfilled", (req, res, next) => {
+  console.log("WEBHOOK REQUEST RECEIVED:", new Date().toISOString());
+  next();
 });
