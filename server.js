@@ -21,7 +21,11 @@ const GOOGLE_PRIVATE_KEY =
   process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
 const SYNC_INTERVAL_MS = 60 * 1000;
-const REQUEST_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = 30000;
+
+// Limit the number of pages fetched in a single cycle to avoid
+// an excessively long sync. The next cycle will continue checking.
+const MAX_PAGES_PER_SYNC = 20;
 
 const REQUIRED_ENV = [
   "SHOPIFY_STORE",
@@ -54,27 +58,36 @@ const sheets = google.sheets({
   auth,
 });
 
-const SHEET_RANGE =
-  `'${GOOGLE_SHEET_TAB.replace(/'/g, "''")}'!A:E`;
-
-const ORDER_NUMBER_RANGE =
-  `'${GOOGLE_SHEET_TAB.replace(/'/g, "''")}'!B:B`;
+const escapedTab = GOOGLE_SHEET_TAB.replace(/'/g, "''");
+const SHEET_RANGE = `'${escapedTab}'!A:E`;
+const ORDER_NUMBER_RANGE = `'${escapedTab}'!B:B`;
 
 // ============================================================
-// SHOPIFY FETCH
+// SHOPIFY PAGINATION
 // ============================================================
 
-async function fetchFulfilledOrders() {
-  console.log("Connecting to Shopify...");
-
+async function fetchAllOrders() {
   const orders = [];
+  const seenUrls = new Set();
 
   let nextUrl =
     `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders.json` +
-    "?status=any&fulfillment_status=shipped&limit=250";
+    "?status=any&limit=250&order=updated_at%20asc";
 
-  while (nextUrl) {
-    console.log("Requesting orders from Shopify...");
+  let pageCount = 0;
+  let reachedEnd = false;
+
+  while (nextUrl && pageCount < MAX_PAGES_PER_SYNC) {
+    if (seenUrls.has(nextUrl)) {
+      throw new Error(
+        "Shopify returned a repeated pagination URL. Stopping to prevent an infinite loop."
+      );
+    }
+
+    seenUrls.add(nextUrl);
+    pageCount++;
+
+    console.log(`Fetching Shopify order page ${pageCount}...`);
 
     const response = await fetch(nextUrl, {
       headers: {
@@ -88,7 +101,6 @@ async function fetchFulfilledOrders() {
 
     if (!response.ok) {
       const errorText = await response.text();
-
       throw new Error(
         `Shopify API error ${response.status}: ${errorText}`
       );
@@ -97,38 +109,66 @@ async function fetchFulfilledOrders() {
     const data = await response.json();
     const pageOrders = data.orders || [];
 
-    console.log(
-      `Retrieved ${pageOrders.length} order(s) from this page.`
-    );
-
+    console.log(`Retrieved ${pageOrders.length} order(s).`);
     orders.push(...pageOrders);
 
     const linkHeader = response.headers.get("link");
-    const nextMatch = linkHeader?.match(
-      /<([^>]+)>;\s*rel="next"/
-    );
+    const nextMatch = linkHeader?.match(/<([^>]+)>;\s*rel="next"/);
 
     nextUrl = nextMatch ? nextMatch[1] : null;
+
+    if (!nextUrl) {
+      reachedEnd = true;
+    }
+
+    // Shopify's cursor is contained in the rel="next" URL.
   }
 
   console.log(
-    `Shopify retrieval complete. Total orders returned: ${orders.length}`
+    `Retrieved ${orders.length} order(s) across ${pageCount} page(s).`
   );
 
-  return orders;
+  if (!reachedEnd && nextUrl) {
+    console.log(
+      `Page limit reached. More orders remain; the next sync will continue from the beginning.`
+    );
+  }
+
+  return { orders, reachedEnd };
 }
 
 // ============================================================
-// GOOGLE SHEETS SYNC
+// FULFILLMENT DATE
+// ============================================================
+
+function getFulfillmentDate(order) {
+  const fulfillmentDates = (order.fulfillments || [])
+    .map((fulfillment) => new Date(fulfillment.created_at))
+    .filter((date) => !Number.isNaN(date.getTime()));
+
+  const date = fulfillmentDates.length
+    ? new Date(
+        Math.max(...fulfillmentDates.map((item) => item.getTime()))
+      )
+    : new Date(order.updated_at || order.created_at);
+
+  return date.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    month: "2-digit",
+    day: "2-digit",
+    year: "numeric",
+  });
+}
+
+// ============================================================
+// SYNC
 // ============================================================
 
 async function syncOrders() {
   console.log("Starting Shopify order sync:", new Date().toISOString());
 
-  const orders = await fetchFulfilledOrders();
-
-  console.log("Shopify fetch finished; connecting to Google Sheets...");
-  console.log("Checking existing order numbers in Google Sheets...");
+  // Read existing order numbers first.
+  console.log("Reading existing order numbers from Google Sheets...");
 
   const existingResponse = await sheets.spreadsheets.values.get(
     {
@@ -148,25 +188,27 @@ async function syncOrders() {
   );
 
   console.log(
-    `Google Sheets connection successful. Existing order numbers: ${existingOrderNumbers.size}`
+    `Google Sheets connected. Existing order numbers: ${existingOrderNumbers.size}`
   );
+
+  const { orders, reachedEnd } = await fetchAllOrders();
+
+  if (!reachedEnd) {
+    console.warn(
+      "This sync did not reach the end of Shopify history. Only processing orders retrieved in this batch."
+    );
+  }
 
   const rows = [];
 
   for (const order of orders) {
-    // Only process fully fulfilled orders.
     if (order.fulfillment_status !== "fulfilled") {
       continue;
     }
 
     const orderNumber = String(order.name || "").trim();
 
-    if (!orderNumber) {
-      console.warn(`Skipping order ${order.id}: no order number.`);
-      continue;
-    }
-
-    if (existingOrderNumbers.has(orderNumber)) {
+    if (!orderNumber || existingOrderNumbers.has(orderNumber)) {
       continue;
     }
 
@@ -177,55 +219,29 @@ async function syncOrders() {
       continue;
     }
 
-    // Use the latest fulfillment timestamp.
-    const fulfillmentDates = (order.fulfillments || [])
-      .map((fulfillment) => new Date(fulfillment.created_at))
-      .filter((date) => !Number.isNaN(date.getTime()));
-
-    const latestFulfillment = fulfillmentDates.length
-      ? new Date(
-          Math.max(
-            ...fulfillmentDates.map((date) => date.getTime())
-          )
-        )
-      : new Date(order.updated_at || order.created_at);
-
-    const fulfillmentDate = latestFulfillment.toLocaleDateString(
-      "en-US",
-      {
-        timeZone: "America/New_York",
-        month: "2-digit",
-        day: "2-digit",
-        year: "numeric",
-      }
-    );
-
-    // Calculate money in cents to avoid floating-point rounding errors.
     const totalCents = Math.round(total * 100);
     const tenPercentCents = Math.round(totalCents * 0.1);
 
     rows.push([
-      fulfillmentDate,
+      getFulfillmentDate(order),
       orderNumber,
       "wonder portal",
       totalCents / 100,
       tenPercentCents / 100,
     ]);
 
-    // Prevent duplicates within the same sync batch.
+    // Ensure an order can only be added once in this batch.
     existingOrderNumbers.add(orderNumber);
   }
 
-  console.log(
-    `Found ${rows.length} new fulfilled order(s) to add.`
-  );
+  console.log(`Found ${rows.length} new fulfilled order(s).`);
 
   if (rows.length === 0) {
     console.log("No new fulfilled orders to add.");
     return;
   }
 
-  console.log("Writing new rows to Google Sheets...");
+  console.log("Appending new orders to Google Sheets...");
 
   await sheets.spreadsheets.values.append(
     {
@@ -243,21 +259,19 @@ async function syncOrders() {
   );
 
   console.log(
-    `Successfully added ${rows.length} order(s) to Google Sheets.`
+    `Successfully added ${rows.length} new order(s) to Google Sheets.`
   );
 }
 
 // ============================================================
-// SAFE SYNC LOOP
+// SAFE LOOP
 // ============================================================
 
 let syncInProgress = false;
 
 async function runSyncSafely() {
   if (syncInProgress) {
-    console.log(
-      "Previous sync still running; skipping this cycle."
-    );
+    console.log("Previous sync still running; skipping this cycle.");
     return;
   }
 
@@ -267,10 +281,7 @@ async function runSyncSafely() {
     await syncOrders();
   } catch (error) {
     console.error("Order sync failed:", error.message || error);
-
-    if (error.stack) {
-      console.error(error.stack);
-    }
+    if (error.stack) console.error(error.stack);
   } finally {
     syncInProgress = false;
   }
@@ -281,17 +292,12 @@ async function runSyncSafely() {
 // ============================================================
 
 app.get("/", (req, res) => {
-  res.status(200).send(
-    "Shopify to Google Sheets sync is running."
-  );
+  res.status(200).send("Shopify to Google Sheets sync is running.");
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Shopify to Google Sheets app running on port ${PORT}`
-  );
+  console.log(`Shopify to Google Sheets app running on port ${PORT}`);
 
-  // Run once immediately, then every minute.
   runSyncSafely();
   setInterval(runSyncSafely, SYNC_INTERVAL_MS);
 });
