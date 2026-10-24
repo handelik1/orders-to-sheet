@@ -1,4 +1,3 @@
-
 import express from "express";
 import crypto from "node:crypto";
 import { google } from "googleapis";
@@ -19,7 +18,9 @@ const REQUIRED_ENV = [
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
-    throw new Error(`Missing required Render environment variable: ${key}`);
+    throw new Error(
+      `Missing required Render environment variable: ${key}`
+    );
   }
 }
 
@@ -33,10 +34,21 @@ const auth = new google.auth.GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 
-const sheets = google.sheets({ version: "v4", auth });
+const sheets = google.sheets({
+  version: "v4",
+  auth,
+});
 
 const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
+app.get("/", (req, res) => {
+  res.status(200).send("Wonder Portal order logger is running.");
+});
 
 // ============================================================
 // SHOPIFY FULFILLED ORDER WEBHOOK
@@ -46,6 +58,15 @@ app.post(
   "/webhooks/orders-fulfilled",
   express.raw({ type: "application/json" }),
   async (req, res) => {
+    console.log(
+      "WEBHOOK REQUEST RECEIVED:",
+      new Date().toISOString()
+    );
+
+    // --------------------------------------------------------
+    // VERIFY SHOPIFY HMAC SIGNATURE
+    // --------------------------------------------------------
+
     const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
 
     if (!hmacHeader || !Buffer.isBuffer(req.body)) {
@@ -69,8 +90,13 @@ app.post(
       suppliedDigest.length !== digest.length ||
       !crypto.timingSafeEqual(suppliedDigest, digest)
     ) {
+      console.error("Shopify webhook signature verification failed.");
       return res.status(401).send("Invalid Shopify signature");
     }
+
+    // --------------------------------------------------------
+    // PARSE ORDER
+    // --------------------------------------------------------
 
     let order;
 
@@ -81,17 +107,32 @@ app.post(
     }
 
     try {
-      // Only process fully fulfilled orders.
+      console.log(
+        `Received order webhook: ${order.name || "(no order number)"}`
+      );
+
+      // Only record orders that are fully fulfilled.
       if (order.fulfillment_status !== "fulfilled") {
-        console.log(`Order ${order.name} is not fully fulfilled; skipped.`);
+        console.log(
+          `Order ${order.name} is not fully fulfilled; skipped.`
+        );
         return res.status(200).send("Not fully fulfilled; skipped");
       }
 
-      if (order.id == null || !order.name || order.total_price == null) {
-        throw new Error("Webhook is missing required order information");
+      if (
+        order.id == null ||
+        !order.name ||
+        order.total_price == null
+      ) {
+        throw new Error(
+          "Webhook is missing required order information"
+        );
       }
 
-      // Get the latest fulfillment timestamp when available.
+      // ------------------------------------------------------
+      // FULFILLMENT DATE
+      // ------------------------------------------------------
+
       const fulfillments = Array.isArray(order.fulfillments)
         ? order.fulfillments
         : [];
@@ -104,7 +145,9 @@ app.post(
 
       const latestFulfillment = fulfillmentDates.length
         ? new Date(
-            Math.max(...fulfillmentDates.map((date) => date.getTime()))
+            Math.max(
+              ...fulfillmentDates.map((date) => date.getTime())
+            )
           )
         : null;
 
@@ -117,10 +160,28 @@ app.post(
         year: "numeric",
       });
 
-      // Check existing order numbers in column B to avoid duplicates.
+      // ------------------------------------------------------
+      // PRICE AND 10% CALCULATION
+      // ------------------------------------------------------
+
+      // Uses the full order total supplied by Shopify.
+      const price = Number(order.total_price);
+
+      if (!Number.isFinite(price) || price < 0) {
+        throw new Error("Invalid order total");
+      }
+
+      const priceCents = Math.round(price * 100);
+      const tenPercentCents = Math.round(priceCents * 0.10);
+
+      // ------------------------------------------------------
+      // PREVENT DUPLICATE ROWS
+      // ------------------------------------------------------
+
+      // Read existing order numbers from column B.
       const existing = await sheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
-        range: `${SHEET_TAB}!B:B`,
+        range: `'${SHEET_TAB.replace(/'/g, "''")}'!B:B`,
       });
 
       const orderNumbers = (existing.data.values || [])
@@ -128,22 +189,29 @@ app.post(
         .map((value) => String(value).trim());
 
       if (orderNumbers.includes(String(order.name).trim())) {
-        console.log(`Order ${order.name} already exists; skipped.`);
+        console.log(
+          `Order ${order.name} already exists; skipped.`
+        );
         return res.status(200).send("Order already recorded");
       }
 
-      // Entire order total, including discounts, shipping, and taxes.
-      const priceCents = Math.round(Number(order.total_price) * 100);
+      // ------------------------------------------------------
+      // APPEND ONE ROW TO GOOGLE SHEETS
+      // ------------------------------------------------------
 
-      if (!Number.isSafeInteger(priceCents) || priceCents < 0) {
-        throw new Error("Invalid order total");
-      }
+      // Columns:
+      // A = Fulfillment Date
+      // B = Order Number
+      // C = Source
+      // D = Entire Order Total
+      // E = 10% of Order Total
 
-      const tenPercentCents = Math.round(priceCents * 0.10);
+      const sheetRange =
+        `'${SHEET_TAB.replace(/'/g, "''")}'!A:E`;
 
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
-        range: `${SHEET_TAB}!A:E`,
+        range: sheetRange,
         valueInputOption: "USER_ENTERED",
         insertDataOption: "INSERT_ROWS",
         requestBody: {
@@ -159,7 +227,7 @@ app.post(
 
       console.log(
         `Recorded order ${order.name}: ` +
-        `$${(priceCents / 100).toFixed(2)}, ` +
+        `$${(priceCents / 100).toFixed(2)}; ` +
         `10% = $${(tenPercentCents / 100).toFixed(2)}`
       );
 
@@ -172,15 +240,11 @@ app.post(
 );
 
 // ============================================================
-// HEALTH CHECK
+// START SERVER
 // ============================================================
 
-app.get("/", (req, res) => {
-  console.log("Health check received:", new Date().toISOString());
-  res.status(200).send("Wonder Portal order logger is running.");
-});
-
-app.post("/webhooks/orders-fulfilled", (req, res, next) => {
-  console.log("WEBHOOK REQUEST RECEIVED:", new Date().toISOString());
-  next();
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(
+    `Wonder Portal order logger is running on port ${PORT}`
+  );
 });
