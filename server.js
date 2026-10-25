@@ -1,5 +1,6 @@
 
 import express from "express";
+import crypto from "node:crypto";
 import { google } from "googleapis";
 
 const app = express();
@@ -11,23 +12,26 @@ const PORT = process.env.PORT || 3000;
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+
 const SHOPIFY_API_VERSION = "2026-10";
+const WEBHOOK_URL =
+  "https://orders-to-sheet.onrender.com/webhooks/orders-fulfilled";
 
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const GOOGLE_SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
 const GOOGLE_SERVICE_ACCOUNT_EMAIL =
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const GOOGLE_PRIVATE_KEY =
-  process.env.GOOGLE_PRIVATE_KEY
-    ?.replace(/^["']|["']$/g, "")
-    .replace(/\\n/g, "\n");
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY
+  ?.replace(/^["']|["']$/g, "")
+  .replace(/\\n/g, "\n");
 
-const SYNC_INTERVAL_MS = 60 * 1000;
 const REQUEST_TIMEOUT_MS = 20000;
 
 const REQUIRED_ENV = [
   "SHOPIFY_STORE",
   "SHOPIFY_ACCESS_TOKEN",
+  "SHOPIFY_API_SECRET",
   "GOOGLE_SHEET_ID",
   "GOOGLE_SERVICE_ACCOUNT_EMAIL",
   "GOOGLE_PRIVATE_KEY",
@@ -61,52 +65,160 @@ const SHEET_RANGE = `'${escapedTab}'!A:E`;
 const ORDER_NUMBER_RANGE = `'${escapedTab}'!B:B`;
 
 // ============================================================
-// FETCH ONLY SHOPIFY PAGE 1
+// VERIFY SHOPIFY WEBHOOK SIGNATURE
 // ============================================================
 
-async function fetchFirstPageOrders() {
+function verifyShopifyWebhook(rawBody, providedHmac) {
+  if (!providedHmac || !Buffer.isBuffer(rawBody)) {
+    return false;
+  }
+
+  const calculatedHmac = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET)
+    .update(rawBody)
+    .digest("base64");
+
+  const expected = Buffer.from(calculatedHmac, "utf8");
+  const received = Buffer.from(providedHmac, "utf8");
+
+  return (
+    expected.length === received.length &&
+    crypto.timingSafeEqual(expected, received)
+  );
+}
+
+// ============================================================
+// REGISTER WEBHOOK WITH SHOPIFY
+// ============================================================
+
+
+async function ensureWebhookRegistered() {
   const url =
-    `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders.json` +
-    "?status=any&limit=250&order=updated_at%20desc";
+    `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-  console.log("Fetching Shopify order page 1 only...");
+  console.log("Checking Shopify webhook registration through GraphQL...");
 
-  const response = await fetch(url, {
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-      Accept: "application/json",
+  const query = `
+    query {
+      webhookSubscriptions(first: 250) {
+        nodes {
+          id
+          topic
+          uri
+        }
+      }
+    }
+  `;
+
+  async function shopifyGraphQL(query, variables = {}) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok || result.errors?.length) {
+      throw new Error(
+        `Shopify GraphQL error: ${JSON.stringify(
+          result.errors || result
+        )}`
+      );
+    }
+
+    return result.data;
+  }
+
+  const data = await shopifyGraphQL(query);
+
+  const existing = data.webhookSubscriptions.nodes.find(
+    (webhook) =>
+      webhook.topic === "ORDERS_FULFILLED" &&
+      webhook.uri === WEBHOOK_URL
+  );
+
+  if (existing) {
+    console.log(
+      `Fulfillment webhook already registered. ID: ${existing.id}`
+    );
+    return;
+  }
+
+  console.log("Registering ORDERS_FULFILLED webhook...");
+
+  const mutation = `
+    mutation CreateFulfillmentWebhook(
+      $topic: WebhookSubscriptionTopic!,
+      $webhookSubscription: WebhookSubscriptionInput!
+    ) {
+      webhookSubscriptionCreate(
+        topic: $topic,
+        webhookSubscription: $webhookSubscription
+      ) {
+        webhookSubscription {
+          id
+          topic
+          uri
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(mutation, {
+    topic: "ORDERS_FULFILLED",
+    webhookSubscription: {
+      uri: WEBHOOK_URL,
+      format: "JSON",
     },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
-  console.log(`Shopify responded with status ${response.status}`);
+  const created = result.webhookSubscriptionCreate;
+  const errors = created.userErrors || [];
 
-  if (!response.ok) {
-    const errorText = await response.text();
+  if (errors.length) {
     throw new Error(
-      `Shopify API error ${response.status}: ${errorText}`
+      `Shopify could not register the webhook: ${JSON.stringify(errors)}`
     );
   }
 
-  const data = await response.json();
-  const orders = data.orders || [];
-
-  console.log(`Retrieved ${orders.length} order(s) from page 1.`);
-  return orders;
+  console.log(
+    `Webhook registered successfully. ID: ${
+      created.webhookSubscription?.id || "unknown"
+    }`
+  );
 }
+
 
 // ============================================================
 // FULFILLMENT DATE
 // ============================================================
 
-function getFulfillmentDate(order) {
+function getFulfillmentDate(order, triggeredAt) {
   const dates = (order.fulfillments || [])
     .map((fulfillment) => new Date(fulfillment.created_at))
     .filter((date) => !Number.isNaN(date.getTime()));
 
-  const date = dates.length
-    ? new Date(Math.max(...dates.map((item) => item.getTime())))
-    : new Date(order.updated_at || order.created_at);
+  let date;
+
+  if (dates.length) {
+    date = new Date(
+      Math.max(...dates.map((item) => item.getTime()))
+    );
+  } else {
+    date = new Date(
+      triggeredAt || order.updated_at || order.created_at
+    );
+  }
 
   return date.toLocaleDateString("en-US", {
     timeZone: "America/New_York",
@@ -117,15 +229,25 @@ function getFulfillmentDate(order) {
 }
 
 // ============================================================
-// SYNC ORDERS
+// PROCESS A FULFILLED ORDER
 // ============================================================
 
-async function syncOrders() {
-  console.log("Starting Shopify order sync:", new Date().toISOString());
+async function processFulfilledOrder(order, triggeredAt) {
+  const orderNumber = String(order.name || "").trim();
 
-  const orders = await fetchFirstPageOrders();
+  if (!orderNumber) {
+    throw new Error("Webhook order has no order number.");
+  }
 
-  console.log("Reading existing order numbers from Google Sheets...");
+  // Confirm the order is fully fulfilled.
+  if (order.fulfillment_status !== "fulfilled") {
+    console.log(
+      `Ignoring ${orderNumber}: fulfillment status is ${order.fulfillment_status ?? "null"}.`
+    );
+    return;
+  }
+
+  console.log(`Checking spreadsheet for ${orderNumber}...`);
 
   const existingResponse = await sheets.spreadsheets.values.get(
     {
@@ -144,53 +266,27 @@ async function syncOrders() {
       .filter(Boolean)
   );
 
-  console.log(
-    `Google Sheets connected. Existing order numbers: ${existingOrderNumbers.size}`
-  );
-
-  const rows = [];
-
-  for (const order of orders) {
-    if (order.fulfillment_status !== "fulfilled") {
-      continue;
-    }
-
-    const orderNumber = String(order.name || "").trim();
-
-    if (!orderNumber || existingOrderNumbers.has(orderNumber)) {
-      continue;
-    }
-
-    const total = Number(order.total_price);
-
-    if (!Number.isFinite(total) || total < 0) {
-      console.warn(`Skipping ${orderNumber}: invalid order total.`);
-      continue;
-    }
-
-    const totalCents = Math.round(total * 100);
-    const tenPercentCents = Math.round(totalCents * 0.1);
-
-    rows.push([
-      getFulfillmentDate(order),
-      orderNumber,
-      "wonder portal",
-      totalCents / 100,
-      tenPercentCents / 100,
-    ]);
-
-    // Avoid duplicate order numbers within this run.
-    existingOrderNumbers.add(orderNumber);
-  }
-
-  console.log(`Found ${rows.length} new fulfilled order(s).`);
-
-  if (rows.length === 0) {
-    console.log("No new fulfilled orders to add.");
+  if (existingOrderNumbers.has(orderNumber)) {
+    console.log(`${orderNumber} is already in the sheet; skipping.`);
     return;
   }
 
-  console.log("Appending rows to Google Sheets...");
+  const total = Number(order.total_price);
+
+  if (!Number.isFinite(total) || total < 0) {
+    throw new Error(`Invalid total for ${orderNumber}.`);
+  }
+
+  const totalCents = Math.round(total * 100);
+  const tenPercentCents = Math.round(totalCents * 0.1);
+
+  const row = [
+    getFulfillmentDate(order, triggeredAt),
+    orderNumber,
+    "wonder portal",
+    totalCents / 100,
+    tenPercentCents / 100,
+  ];
 
   await sheets.spreadsheets.values.append(
     {
@@ -199,7 +295,7 @@ async function syncOrders() {
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: {
-        values: rows,
+        values: [row],
       },
     },
     {
@@ -207,46 +303,96 @@ async function syncOrders() {
     }
   );
 
-  console.log(
-    `Successfully added ${rows.length} order(s) to Google Sheets.`
-  );
+  console.log(`Successfully added ${orderNumber} to Google Sheets.`);
 }
 
 // ============================================================
-// SAFE SYNC LOOP
+// WEBHOOK RECEIVER
+// IMPORTANT: Keep the raw-body parser on this route.
 // ============================================================
 
-let syncInProgress = false;
+let webhookProcessing = Promise.resolve();
 
-async function runSyncSafely() {
-  if (syncInProgress) {
-    console.log("Previous sync still running; skipping this cycle.");
-    return;
+app.post(
+  "/webhooks/orders-fulfilled",
+  express.raw({ type: "application/json", limit: "2mb" }),
+  async (req, res) => {
+    const providedHmac = req.get("X-Shopify-Hmac-SHA256");
+
+    if (!verifyShopifyWebhook(req.body, providedHmac)) {
+      console.warn("Rejected webhook: invalid HMAC signature.");
+      return res.status(401).send("Invalid webhook signature.");
+    }
+
+    const topic = req.get("X-Shopify-Topic");
+    const shopDomain = req.get("X-Shopify-Shop-Domain");
+    const webhookId = req.get("X-Shopify-Webhook-Id");
+
+    if (topic !== "orders/fulfilled") {
+      return res.status(400).send("Unexpected webhook topic.");
+    }
+
+    if (
+      shopDomain &&
+      shopDomain.toLowerCase() !== SHOPIFY_STORE.toLowerCase()
+    ) {
+      return res.status(401).send("Unexpected Shopify shop.");
+    }
+
+    let order;
+
+    try {
+      order = JSON.parse(req.body.toString("utf8"));
+    } catch {
+      return res.status(400).send("Invalid JSON payload.");
+    }
+
+    console.log(
+      `Received orders/fulfilled webhook. Delivery ID: ${webhookId || "not provided"}`
+    );
+
+    const triggeredAt = req.get("X-Shopify-Triggered-At");
+
+    // Serialize work so simultaneous deliveries do not race while
+    // checking for an existing order number in Google Sheets.
+    const task = webhookProcessing.then(() =>
+      processFulfilledOrder(order, triggeredAt)
+    );
+
+    webhookProcessing = task.catch(() => {});
+
+    try {
+      await task;
+      return res.status(200).send("Webhook processed.");
+    } catch (error) {
+      console.error(
+        "Webhook processing failed:",
+        error.message || error
+      );
+      return res.status(500).send("Webhook processing failed.");
+    }
   }
-
-  syncInProgress = true;
-
-  try {
-    await syncOrders();
-  } catch (error) {
-    console.error("Order sync failed:", error.message || error);
-    if (error.stack) console.error(error.stack);
-  } finally {
-    syncInProgress = false;
-  }
-}
+);
 
 // ============================================================
-// SERVER
+// HEALTH CHECK
 // ============================================================
 
 app.get("/", (req, res) => {
-  res.status(200).send("Shopify to Google Sheets sync is running.");
+  res.status(200).send("Shopify fulfillment webhook receiver is running.");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Shopify to Google Sheets app running on port ${PORT}`);
+// ============================================================
+// START SERVER AND REGISTER WEBHOOK
+// ============================================================
 
-  runSyncSafely();
-  setInterval(runSyncSafely, SYNC_INTERVAL_MS);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Shopify webhook app running on port ${PORT}`);
+
+  ensureWebhookRegistered().catch((error) => {
+    console.error(
+      "Webhook registration failed:",
+      error.message || error
+    );
+  });
 });
