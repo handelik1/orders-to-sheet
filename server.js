@@ -14,19 +14,24 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 
-// SECOND STORE: NAYA
+// NAYA STORE - DEV DASHBOARD CREDENTIALS
 const NAYA_SHOPIFY_STORE = process.env.NAYA_SHOPIFY_STORE;
-const NAYA_SHOPIFY_WEBHOOK_SECRET =
-  process.env.NAYA_SHOPIFY_WEBHOOK_SECRET;
+const NAYA_SHOPIFY_CLIENT_ID =
+  process.env.NAYA_SHOPIFY_CLIENT_ID;
+const NAYA_SHOPIFY_CLIENT_SECRET =
+  process.env.NAYA_SHOPIFY_CLIENT_SECRET;
 
 const SHOPIFY_API_VERSION = "2026-10";
 
 const WEBHOOK_URL =
   "https://orders-to-sheet.onrender.com/webhooks/orders-fulfilled";
 
+const REQUEST_TIMEOUT_MS = 20000;
+
 // GOOGLE SHEETS
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
+const GOOGLE_SHEET_TAB =
+  process.env.GOOGLE_SHEET_TAB || "Sheet1";
 
 const GOOGLE_SERVICE_ACCOUNT_EMAIL =
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -34,8 +39,6 @@ const GOOGLE_SERVICE_ACCOUNT_EMAIL =
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY
   ?.replace(/^["']|["']$/g, "")
   .replace(/\\n/g, "\n");
-
-const REQUEST_TIMEOUT_MS = 20000;
 
 // ============================================================
 // REQUIRED ENVIRONMENT VARIABLES
@@ -46,7 +49,8 @@ const REQUIRED_ENV = [
   "SHOPIFY_ACCESS_TOKEN",
   "SHOPIFY_API_SECRET",
   "NAYA_SHOPIFY_STORE",
-  "NAYA_SHOPIFY_WEBHOOK_SECRET",
+  "NAYA_SHOPIFY_CLIENT_ID",
+  "NAYA_SHOPIFY_CLIENT_SECRET",
   "GOOGLE_SHEET_ID",
   "GOOGLE_SERVICE_ACCOUNT_EMAIL",
   "GOOGLE_PRIVATE_KEY",
@@ -111,10 +115,100 @@ const STORES = new Map([
     {
       name: "NAYA",
       source: "NAYA portal",
-      webhookSecret: NAYA_SHOPIFY_WEBHOOK_SECRET,
+      webhookSecret: NAYA_SHOPIFY_CLIENT_SECRET,
     },
   ],
 ]);
+
+// ============================================================
+// NAYA ACCESS TOKEN
+// AUTOMATICALLY OBTAIN AND REFRESH THE TOKEN
+// ============================================================
+
+let nayaAccessToken = null;
+let nayaTokenExpiresAt = 0;
+let nayaTokenRequest = null;
+
+async function getNayaAccessToken() {
+  // Reuse the cached token while it is valid.
+  // Refresh one minute before its expiration.
+  if (
+    nayaAccessToken &&
+    Date.now() < nayaTokenExpiresAt
+  ) {
+    return nayaAccessToken;
+  }
+
+  // Prevent simultaneous requests from requesting
+  // multiple tokens at the same time.
+  if (nayaTokenRequest) {
+    return nayaTokenRequest;
+  }
+
+  nayaTokenRequest = (async () => {
+    console.log(
+      "Requesting NAYA Shopify Admin API access token..."
+    );
+
+    const tokenUrl =
+      `https://${NAYA_SHOPIFY_STORE}/admin/oauth/access_token`;
+
+    const body = new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: NAYA_SHOPIFY_CLIENT_ID,
+      client_secret: NAYA_SHOPIFY_CLIENT_SECRET,
+    });
+
+    const response = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    let result;
+
+    try {
+      result = await response.json();
+    } catch {
+      throw new Error(
+        `NAYA token request returned an invalid response. HTTP ${response.status}.`
+      );
+    }
+
+    if (!response.ok || !result.access_token) {
+      throw new Error(
+        `NAYA token request failed. HTTP ${response.status}: ${
+          JSON.stringify(result)
+        }`
+      );
+    }
+
+    nayaAccessToken = result.access_token;
+
+    const expiresIn = Number(result.expires_in) || 86400;
+
+    nayaTokenExpiresAt =
+      Date.now() + expiresIn * 1000 - 60000;
+
+    console.log(
+      `NAYA Shopify access token obtained successfully. Expires in approximately ${Math.floor(
+        expiresIn / 3600
+      )} hours.`
+    );
+
+    return nayaAccessToken;
+  })();
+
+  try {
+    return await nayaTokenRequest;
+  } finally {
+    nayaTokenRequest = null;
+  }
+}
 
 // ============================================================
 // VERIFY SHOPIFY WEBHOOK SIGNATURE
@@ -138,8 +232,15 @@ function verifyShopifyWebhook(
     .update(rawBody)
     .digest("base64");
 
-  const expected = Buffer.from(calculatedHmac, "utf8");
-  const received = Buffer.from(providedHmac, "utf8");
+  const expected = Buffer.from(
+    calculatedHmac,
+    "utf8"
+  );
+
+  const received = Buffer.from(
+    providedHmac,
+    "utf8"
+  );
 
   return (
     expected.length === received.length &&
@@ -148,16 +249,64 @@ function verifyShopifyWebhook(
 }
 
 // ============================================================
-// REGISTER WONDER WEBHOOK WITH SHOPIFY
-// NAYA WEBHOOK IS CREATED MANUALLY IN SHOPIFY ADMIN
+// SHOPIFY GRAPHQL HELPER
 // ============================================================
 
-async function ensureWebhookRegistered() {
+async function shopifyGraphQL(
+  store,
+  accessToken,
+  query,
+  variables = {}
+) {
   const url =
-    `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+    `https://${store}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      query,
+      variables,
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+
+  let result;
+
+  try {
+    result = await response.json();
+  } catch {
+    throw new Error(
+      `Shopify GraphQL returned an invalid response. HTTP ${response.status}.`
+    );
+  }
+
+  if (!response.ok || result.errors?.length) {
+    throw new Error(
+      `Shopify GraphQL error: ${JSON.stringify(
+        result.errors || result
+      )}`
+    );
+  }
+
+  return result.data;
+}
+
+// ============================================================
+// REGISTER A STORE'S FULFILLMENT WEBHOOK
+// ============================================================
+
+async function registerFulfillmentWebhook(
+  store,
+  accessToken,
+  storeName
+) {
   console.log(
-    "Checking WONDER Shopify webhook registration through GraphQL..."
+    `Checking ${storeName} Shopify webhook registration through GraphQL...`
   );
 
   const query = `
@@ -172,50 +321,30 @@ async function ensureWebhookRegistered() {
     }
   `;
 
-  async function shopifyGraphQL(query, variables = {}) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        query,
-        variables,
-      }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-
-    const result = await response.json();
-
-    if (!response.ok || result.errors?.length) {
-      throw new Error(
-        `Shopify GraphQL error: ${JSON.stringify(
-          result.errors || result
-        )}`
-      );
-    }
-
-    return result.data;
-  }
-
-  const data = await shopifyGraphQL(query);
-
-  const existing = data.webhookSubscriptions.nodes.find(
-    (webhook) =>
-      webhook.topic === "ORDERS_FULFILLED" &&
-      webhook.uri === WEBHOOK_URL
+  const data = await shopifyGraphQL(
+    store,
+    accessToken,
+    query
   );
+
+  const existing =
+    data.webhookSubscriptions.nodes.find(
+      (webhook) =>
+        webhook.topic === "ORDERS_FULFILLED" &&
+        webhook.uri === WEBHOOK_URL
+    );
 
   if (existing) {
     console.log(
-      `WONDER fulfillment webhook already registered. ID: ${existing.id}`
+      `${storeName} fulfillment webhook already registered. ID: ${existing.id}`
     );
+
     return;
   }
 
-  console.log("Registering WONDER ORDERS_FULFILLED webhook...");
+  console.log(
+    `Registering ${storeName} ORDERS_FULFILLED webhook...`
+  );
 
   const mutation = `
     mutation CreateFulfillmentWebhook(
@@ -239,29 +368,60 @@ async function ensureWebhookRegistered() {
     }
   `;
 
-  const result = await shopifyGraphQL(mutation, {
-    topic: "ORDERS_FULFILLED",
-    webhookSubscription: {
-      uri: WEBHOOK_URL,
-      format: "JSON",
-    },
-  });
+  const result = await shopifyGraphQL(
+    store,
+    accessToken,
+    mutation,
+    {
+      topic: "ORDERS_FULFILLED",
+      webhookSubscription: {
+        uri: WEBHOOK_URL,
+        format: "JSON",
+      },
+    }
+  );
 
   const created = result.webhookSubscriptionCreate;
   const errors = created.userErrors || [];
 
   if (errors.length) {
     throw new Error(
-      `Shopify could not register the WONDER webhook: ${JSON.stringify(
+      `Shopify could not register the ${storeName} webhook: ${JSON.stringify(
         errors
       )}`
     );
   }
 
   console.log(
-    `WONDER webhook registered successfully. ID: ${
+    `${storeName} webhook registered successfully. ID: ${
       created.webhookSubscription?.id || "unknown"
     }`
+  );
+}
+
+// ============================================================
+// REGISTER WONDER WEBHOOK
+// ============================================================
+
+async function ensureWebhookRegistered() {
+  await registerFulfillmentWebhook(
+    SHOPIFY_STORE,
+    SHOPIFY_ACCESS_TOKEN,
+    "WONDER"
+  );
+}
+
+// ============================================================
+// REGISTER NAYA WEBHOOK
+// ============================================================
+
+async function ensureNayaWebhookRegistered() {
+  const accessToken = await getNayaAccessToken();
+
+  await registerFulfillmentWebhook(
+    NAYA_SHOPIFY_STORE,
+    accessToken,
+    "NAYA"
   );
 }
 
@@ -312,7 +472,9 @@ async function processFulfilledOrder(
   triggeredAt,
   storeConfig
 ) {
-  const orderNumber = String(order.name || "").trim();
+  const orderNumber = String(
+    order.name || ""
+  ).trim();
 
   if (!orderNumber) {
     throw new Error(
@@ -346,9 +508,9 @@ async function processFulfilledOrder(
       }
     );
 
-  // Check BOTH order number and store source.
-  // This prevents overlapping order numbers
-  // between WONDER and NAYA from being skipped.
+  // Check BOTH order number and source.
+  // This allows the same order number to exist
+  // in both WONDER and NAYA.
 
   const alreadyExists = (
     existingResponse.data.values || []
@@ -376,11 +538,11 @@ async function processFulfilledOrder(
   }
 
   const totalCents = Math.round(total * 100);
+
   const tenPercentCents = Math.round(
     totalCents * 0.1
   );
 
-  // GOOGLE SHEETS ROW
   const row = [
     getFulfillmentDate(order, triggeredAt),
     orderNumber,
@@ -411,7 +573,7 @@ async function processFulfilledOrder(
 
 // ============================================================
 // WEBHOOK RECEIVER
-// IMPORTANT: KEEP THE RAW-BODY PARSER ON THIS ROUTE.
+// KEEP THE RAW-BODY PARSER ON THIS ROUTE.
 // ============================================================
 
 let webhookProcessing = Promise.resolve();
@@ -427,7 +589,9 @@ app.post(
       "X-Shopify-Hmac-SHA256"
     );
 
-    const topic = req.get("X-Shopify-Topic");
+    const topic = req.get(
+      "X-Shopify-Topic"
+    );
 
     const shopDomain = String(
       req.get("X-Shopify-Shop-Domain") || ""
@@ -546,7 +710,7 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
-// START SERVER AND REGISTER WONDER WEBHOOK
+// START SERVER AND REGISTER BOTH WEBHOOKS
 // ============================================================
 
 app.listen(PORT, "0.0.0.0", () => {
@@ -558,9 +722,20 @@ app.listen(PORT, "0.0.0.0", () => {
     "Configured webhook stores: WONDER and NAYA."
   );
 
+  // Register both stores independently.
+  // A failure registering one will not prevent
+  // the other store from registering.
+
   ensureWebhookRegistered().catch((error) => {
     console.error(
       "WONDER webhook registration failed:",
+      error.message || error
+    );
+  });
+
+  ensureNayaWebhookRegistered().catch((error) => {
+    console.error(
+      "NAYA webhook registration failed:",
       error.message || error
     );
   });
