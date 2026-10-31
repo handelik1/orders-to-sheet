@@ -1,3 +1,4 @@
+
 import express from "express";
 import crypto from "node:crypto";
 import { google } from "googleapis";
@@ -9,22 +10,29 @@ const PORT = process.env.PORT || 3000;
 // CONFIGURATION
 // ============================================================
 
-// EXISTING WONDER STORE
+// WONDER
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 
-// NAYA STORE - DEV DASHBOARD CREDENTIALS
+// NAYA
 const NAYA_SHOPIFY_STORE = process.env.NAYA_SHOPIFY_STORE;
 const NAYA_SHOPIFY_CLIENT_ID =
   process.env.NAYA_SHOPIFY_CLIENT_ID;
 const NAYA_SHOPIFY_CLIENT_SECRET =
   process.env.NAYA_SHOPIFY_CLIENT_SECRET;
 
+// This will be added to Render after OAuth authorization.
+const NAYA_SHOPIFY_ACCESS_TOKEN =
+  process.env.NAYA_SHOPIFY_ACCESS_TOKEN;
+
 const SHOPIFY_API_VERSION = "2026-10";
 
 const WEBHOOK_URL =
   "https://orders-to-sheet.onrender.com/webhooks/orders-fulfilled";
+
+const NAYA_REDIRECT_URI =
+  "https://orders-to-sheet.onrender.com/auth/naya/callback";
 
 const REQUEST_TIMEOUT_MS = 20000;
 
@@ -69,7 +77,7 @@ if (
   NAYA_SHOPIFY_STORE.toLowerCase()
 ) {
   throw new Error(
-    "SHOPIFY_STORE and NAYA_SHOPIFY_STORE must be different stores."
+    "WONDER and NAYA must be different stores."
   );
 }
 
@@ -121,125 +129,50 @@ const STORES = new Map([
 ]);
 
 // ============================================================
-// NAYA ACCESS TOKEN
-// AUTOMATICALLY OBTAIN AND REFRESH THE TOKEN
+// OAUTH STATE
 // ============================================================
 
-let nayaAccessToken = null;
-let nayaTokenExpiresAt = 0;
-let nayaTokenRequest = null;
+// Temporary state values protect the OAuth authorization flow.
+// These are held in memory only until the callback is received.
 
-async function getNayaAccessToken() {
-  // Reuse the cached token while it is valid.
-  // Refresh one minute before its expiration.
-  if (
-    nayaAccessToken &&
-    Date.now() < nayaTokenExpiresAt
-  ) {
-    return nayaAccessToken;
-  }
-
-  // Prevent simultaneous requests from requesting
-  // multiple tokens at the same time.
-  if (nayaTokenRequest) {
-    return nayaTokenRequest;
-  }
-
-  nayaTokenRequest = (async () => {
-    console.log(
-      "Requesting NAYA Shopify Admin API access token..."
-    );
-
-    const tokenUrl =
-      `https://${NAYA_SHOPIFY_STORE}/admin/oauth/access_token`;
-
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: NAYA_SHOPIFY_CLIENT_ID,
-      client_secret: NAYA_SHOPIFY_CLIENT_SECRET,
-    });
-
-    const response = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-
-    let result;
-
-    try {
-      result = await response.json();
-    } catch {
-      throw new Error(
-        `NAYA token request returned an invalid response. HTTP ${response.status}.`
-      );
-    }
-
-    if (!response.ok || !result.access_token) {
-      throw new Error(
-        `NAYA token request failed. HTTP ${response.status}: ${
-          JSON.stringify(result)
-        }`
-      );
-    }
-
-    nayaAccessToken = result.access_token;
-
-    const expiresIn = Number(result.expires_in) || 86400;
-
-    nayaTokenExpiresAt =
-      Date.now() + expiresIn * 1000 - 60000;
-
-    console.log(
-      `NAYA Shopify access token obtained successfully. Expires in approximately ${Math.floor(
-        expiresIn / 3600
-      )} hours.`
-    );
-
-    return nayaAccessToken;
-  })();
-
-  try {
-    return await nayaTokenRequest;
-  } finally {
-    nayaTokenRequest = null;
-  }
-}
+const oauthStates = new Map();
 
 // ============================================================
-// VERIFY SHOPIFY WEBHOOK SIGNATURE
+// VERIFY SHOPIFY OAUTH CALLBACK HMAC
 // ============================================================
 
-function verifyShopifyWebhook(
-  rawBody,
-  providedHmac,
-  webhookSecret
-) {
-  if (
-    !providedHmac ||
-    !Buffer.isBuffer(rawBody) ||
-    !webhookSecret
-  ) {
+function verifyOAuthHmac(queryString) {
+  const params = new URLSearchParams(queryString);
+
+  const providedHmac = params.get("hmac");
+
+  if (!providedHmac) {
     return false;
   }
 
+  params.delete("hmac");
+  params.delete("signature");
+
+  const message = [...params.entries()]
+    .sort(([keyA], [keyB]) =>
+      keyA.localeCompare(keyB)
+    )
+    .map(([key, value]) => `${key}=${value}`)
+    .join("&");
+
   const calculatedHmac = crypto
-    .createHmac("sha256", webhookSecret)
-    .update(rawBody)
-    .digest("base64");
+    .createHmac("sha256", NAYA_SHOPIFY_CLIENT_SECRET)
+    .update(message)
+    .digest("hex");
 
   const expected = Buffer.from(
     calculatedHmac,
-    "utf8"
+    "hex"
   );
 
   const received = Buffer.from(
     providedHmac,
-    "utf8"
+    "hex"
   );
 
   return (
@@ -249,7 +182,7 @@ function verifyShopifyWebhook(
 }
 
 // ============================================================
-// SHOPIFY GRAPHQL HELPER
+// SHOPIFY GRAPHQL
 // ============================================================
 
 async function shopifyGraphQL(
@@ -275,15 +208,7 @@ async function shopifyGraphQL(
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
-  let result;
-
-  try {
-    result = await response.json();
-  } catch {
-    throw new Error(
-      `Shopify GraphQL returned an invalid response. HTTP ${response.status}.`
-    );
-  }
+  const result = await response.json();
 
   if (!response.ok || result.errors?.length) {
     throw new Error(
@@ -306,7 +231,7 @@ async function registerFulfillmentWebhook(
   storeName
 ) {
   console.log(
-    `Checking ${storeName} Shopify webhook registration through GraphQL...`
+    `Checking ${storeName} Shopify webhook registration...`
   );
 
   const query = `
@@ -386,7 +311,7 @@ async function registerFulfillmentWebhook(
 
   if (errors.length) {
     throw new Error(
-      `Shopify could not register the ${storeName} webhook: ${JSON.stringify(
+      `Could not register ${storeName} webhook: ${JSON.stringify(
         errors
       )}`
     );
@@ -416,14 +341,273 @@ async function ensureWebhookRegistered() {
 // ============================================================
 
 async function ensureNayaWebhookRegistered() {
-  const accessToken = await getNayaAccessToken();
+  if (!NAYA_SHOPIFY_ACCESS_TOKEN) {
+    console.log(
+      "NAYA access token is not configured yet. Complete OAuth authorization."
+    );
+
+    return;
+  }
 
   await registerFulfillmentWebhook(
     NAYA_SHOPIFY_STORE,
-    accessToken,
+    NAYA_SHOPIFY_ACCESS_TOKEN,
     "NAYA"
   );
 }
+
+// ============================================================
+// NAYA OAUTH: START AUTHORIZATION
+// ============================================================
+
+app.get("/auth/naya/start", (req, res) => {
+  const state = crypto.randomBytes(32).toString("hex");
+
+  oauthStates.set(state, {
+    createdAt: Date.now(),
+  });
+
+  const authorizationUrl = new URL(
+    `https://${NAYA_SHOPIFY_STORE}/admin/oauth/authorize`
+  );
+
+  authorizationUrl.searchParams.set(
+    "client_id",
+    NAYA_SHOPIFY_CLIENT_ID
+  );
+
+  authorizationUrl.searchParams.set(
+    "scope",
+    "read_orders"
+  );
+
+  authorizationUrl.searchParams.set(
+    "redirect_uri",
+    NAYA_REDIRECT_URI
+  );
+
+  authorizationUrl.searchParams.set(
+    "state",
+    state
+  );
+
+  console.log(
+    "Starting NAYA OAuth authorization."
+  );
+
+  res.redirect(authorizationUrl.toString());
+});
+
+// ============================================================
+// NAYA OAUTH: CALLBACK
+// ============================================================
+
+app.get("/auth/naya/callback", async (req, res) => {
+  try {
+    const queryString = req.originalUrl.split("?")[1] || "";
+
+    // Verify Shopify's callback signature.
+    if (!verifyOAuthHmac(queryString)) {
+      return res
+        .status(401)
+        .send("Invalid Shopify OAuth signature.");
+    }
+
+    const shop = String(req.query.shop || "")
+      .trim()
+      .toLowerCase();
+
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+
+    if (shop !== NAYA_SHOPIFY_STORE.toLowerCase()) {
+      return res
+        .status(400)
+        .send("Unexpected Shopify store.");
+    }
+
+    if (!state || !oauthStates.has(state)) {
+      return res
+        .status(403)
+        .send("Invalid or expired OAuth state.");
+    }
+
+    const stateData = oauthStates.get(state);
+    oauthStates.delete(state);
+
+    if (
+      Date.now() - stateData.createdAt >
+      10 * 60 * 1000
+    ) {
+      return res
+        .status(403)
+        .send("OAuth authorization expired. Start again.");
+    }
+
+    if (!code) {
+      return res
+        .status(400)
+        .send("Shopify did not provide an authorization code.");
+    }
+
+    console.log(
+      "NAYA authorization approved. Exchanging authorization code..."
+    );
+
+    // Exchange the authorization code for an offline token.
+    const tokenResponse = await fetch(
+      `https://${NAYA_SHOPIFY_STORE}/admin/oauth/access_token`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          client_id: NAYA_SHOPIFY_CLIENT_ID,
+          client_secret: NAYA_SHOPIFY_CLIENT_SECRET,
+          code,
+        }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }
+    );
+
+    const tokenResult = await tokenResponse.json();
+
+    if (
+      !tokenResponse.ok ||
+      !tokenResult.access_token
+    ) {
+      throw new Error(
+        `NAYA token exchange failed. HTTP ${tokenResponse.status}: ${JSON.stringify(
+          tokenResult
+        )}`
+      );
+    }
+
+    const grantedScopes = String(
+      tokenResult.scope || ""
+    )
+      .split(",")
+      .map((scope) => scope.trim());
+
+    if (!grantedScopes.includes("read_orders")) {
+      throw new Error(
+        `NAYA token does not include read_orders. Granted scopes: ${tokenResult.scope || "none"}`
+      );
+    }
+
+    const accessToken = tokenResult.access_token;
+
+    console.log(
+      "NAYA offline access token obtained successfully."
+    );
+
+    // Register the NAYA webhook immediately.
+    let registrationMessage;
+
+    try {
+      await registerFulfillmentWebhook(
+        NAYA_SHOPIFY_STORE,
+        accessToken,
+        "NAYA"
+      );
+
+      registrationMessage =
+        "NAYA fulfillment webhook registered successfully.";
+    } catch (error) {
+      console.error(
+        "NAYA webhook registration failed:",
+        error.message || error
+      );
+
+      registrationMessage =
+        `Token obtained, but webhook registration failed: ${error.message || error}`;
+    }
+
+    // Display the token once so it can be copied into
+    // Render's environment variables.
+    // Never print the token in Render logs.
+
+    const safeToken = accessToken
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    const safeMessage = registrationMessage
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    res
+      .status(200)
+      .type("html")
+      .send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>NAYA Shopify Authorization</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            body {
+              font-family: Arial, sans-serif;
+              max-width: 750px;
+              margin: 50px auto;
+              padding: 20px;
+              line-height: 1.5;
+            }
+            textarea {
+              width: 100%;
+              min-height: 100px;
+              box-sizing: border-box;
+              padding: 12px;
+              font-family: monospace;
+              overflow-wrap: anywhere;
+            }
+            button {
+              padding: 12px 20px;
+              cursor: pointer;
+            }
+          </style>
+        </head>
+        <body>
+          <h2>NAYA Shopify Authorization Complete</h2>
+          <p>${safeMessage}</p>
+          <h3>Your NAYA offline access token</h3>
+          <p>Copy this token and save it in Render as NAYA_SHOPIFY_ACCESS_TOKEN.</p>
+          <textarea id="token" readonly>${safeToken}</textarea>
+          <p>
+            <button onclick="copyToken()">Copy access token</button>
+          </p>
+          <p>
+            After saving the token in Render, redeploy the service.
+            The token will then be available after future restarts.
+          </p>
+          <script>
+            function copyToken() {
+              const field = document.getElementById("token");
+              field.select();
+              field.setSelectionRange(0, field.value.length);
+              navigator.clipboard.writeText(field.value);
+            }
+          </script>
+        </body>
+        </html>
+      `);
+  } catch (error) {
+    console.error(
+      "NAYA OAuth callback failed:",
+      error.message || error
+    );
+
+    res
+      .status(500)
+      .send(
+        `NAYA authorization failed: ${error.message || error}`
+      );
+  }
+});
 
 // ============================================================
 // FULFILLMENT DATE
@@ -482,7 +666,6 @@ async function processFulfilledOrder(
     );
   }
 
-  // Confirm the order is fully fulfilled.
   if (order.fulfillment_status !== "fulfilled") {
     console.log(
       `Ignoring ${orderNumber}: fulfillment status is ${
@@ -507,10 +690,6 @@ async function processFulfilledOrder(
         timeout: REQUEST_TIMEOUT_MS,
       }
     );
-
-  // Check BOTH order number and source.
-  // This allows the same order number to exist
-  // in both WONDER and NAYA.
 
   const alreadyExists = (
     existingResponse.data.values || []
@@ -573,7 +752,7 @@ async function processFulfilledOrder(
 
 // ============================================================
 // WEBHOOK RECEIVER
-// KEEP THE RAW-BODY PARSER ON THIS ROUTE.
+// KEEP RAW-BODY PARSER ON THIS ROUTE.
 // ============================================================
 
 let webhookProcessing = Promise.resolve();
@@ -603,14 +782,12 @@ app.post(
       "X-Shopify-Webhook-Id"
     );
 
-    // Check webhook topic.
     if (topic !== "orders/fulfilled") {
       return res
         .status(400)
         .send("Unexpected webhook topic.");
     }
 
-    // Identify which Shopify store sent the webhook.
     if (!shopDomain || !STORES.has(shopDomain)) {
       console.warn(
         `Rejected webhook from unrecognized Shopify store: ${
@@ -625,7 +802,6 @@ app.post(
 
     const storeConfig = STORES.get(shopDomain);
 
-    // Verify using the correct store's secret.
     if (
       !verifyShopifyWebhook(
         req.body,
@@ -642,7 +818,6 @@ app.post(
         .send("Invalid webhook signature.");
     }
 
-    // Parse order JSON.
     let order;
 
     try {
@@ -664,9 +839,6 @@ app.post(
     const triggeredAt = req.get(
       "X-Shopify-Triggered-At"
     );
-
-    // Serialize processing so simultaneous deliveries
-    // do not race while checking Google Sheets.
 
     const task = webhookProcessing.then(() =>
       processFulfilledOrder(
@@ -710,7 +882,7 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
-// START SERVER AND REGISTER BOTH WEBHOOKS
+// START SERVER AND REGISTER WEBHOOKS
 // ============================================================
 
 app.listen(PORT, "0.0.0.0", () => {
@@ -721,10 +893,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     "Configured webhook stores: WONDER and NAYA."
   );
-
-  // Register both stores independently.
-  // A failure registering one will not prevent
-  // the other store from registering.
 
   ensureWebhookRegistered().catch((error) => {
     console.error(
