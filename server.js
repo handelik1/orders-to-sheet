@@ -33,7 +33,12 @@ const REQUEST_TIMEOUT_MS = 20000;
 
 // GOOGLE SHEETS
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Sheet1";
+
+const GOOGLE_SHEET_TAB_WONDER =
+  process.env.GOOGLE_SHEET_TAB_WONDER || "Wonder";
+
+const GOOGLE_SHEET_TAB_NAYA =
+  process.env.GOOGLE_SHEET_TAB_NAYA || "NAYA";
 
 const GOOGLE_SERVICE_ACCOUNT_EMAIL =
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -80,7 +85,9 @@ const auth = new google.auth.GoogleAuth({
     client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
     private_key: GOOGLE_PRIVATE_KEY,
   },
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  scopes: [
+    "https://www.googleapis.com/auth/spreadsheets",
+  ],
 });
 
 const sheets = google.sheets({
@@ -88,10 +95,14 @@ const sheets = google.sheets({
   auth,
 });
 
-const escapedTab = GOOGLE_SHEET_TAB.replace(/'/g, "''");
+function getSheetRanges(tabName) {
+  const escapedTab = tabName.replace(/'/g, "''");
 
-const SHEET_RANGE = `'${escapedTab}'!A:E`;
-const ORDER_NUMBER_RANGE = `'${escapedTab}'!B:C`;
+  return {
+    sheetRange: `'${escapedTab}'!A:E`,
+    orderNumberRange: `'${escapedTab}'!B:C`,
+  };
+}
 
 // ============================================================
 // STORE CONFIGURATION
@@ -103,6 +114,7 @@ const STORES = new Map([
     {
       name: "WONDER",
       source: "wonder portal",
+      tab: GOOGLE_SHEET_TAB_WONDER,
       webhookSecret: SHOPIFY_API_SECRET,
     },
   ],
@@ -111,6 +123,7 @@ const STORES = new Map([
     {
       name: "NAYA",
       source: "NAYA portal",
+      tab: GOOGLE_SHEET_TAB_NAYA,
       webhookSecret: NAYA_SHOPIFY_CLIENT_SECRET,
     },
   ],
@@ -216,7 +229,11 @@ async function shopifyGraphQL(
 // REGISTER FULFILLMENT WEBHOOK
 // ============================================================
 
-async function registerFulfillmentWebhook(store, accessToken, storeName) {
+async function registerFulfillmentWebhook(
+  store,
+  accessToken,
+  storeName
+) {
   console.log(`Checking ${storeName} Shopify webhook registration...`);
 
   const query = `
@@ -383,7 +400,9 @@ app.get("/auth/naya/callback", async (req, res) => {
     }
 
     if (!code) {
-      return res.status(400).send("Shopify did not provide an authorization code.");
+      return res.status(400).send(
+        "Shopify did not provide an authorization code."
+      );
     }
 
     console.log(
@@ -441,7 +460,10 @@ app.get("/auth/naya/callback", async (req, res) => {
       registrationMessage =
         "NAYA fulfillment webhook registered successfully.";
     } catch (error) {
-      console.error("NAYA webhook registration failed:", error.message || error);
+      console.error(
+        "NAYA webhook registration failed:",
+        error.message || error
+      );
 
       registrationMessage =
         `Token obtained, but webhook registration failed: ${error.message || error}`;
@@ -506,7 +528,10 @@ app.get("/auth/naya/callback", async (req, res) => {
       </html>
     `);
   } catch (error) {
-    console.error("NAYA OAuth callback failed:", error.message || error);
+    console.error(
+      "NAYA OAuth callback failed:",
+      error.message || error
+    );
 
     res.status(500).send(
       `NAYA authorization failed: ${error.message || error}`
@@ -562,13 +587,18 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
   }
 
   console.log(
-    `Checking spreadsheet for ${orderNumber} from ${storeConfig.name}...`
+    `Checking ${storeConfig.tab} spreadsheet tab for ${orderNumber} from ${storeConfig.name}...`
+  );
+
+  // Use this store's own tab for both duplicate checking and appending.
+  const { sheetRange, orderNumberRange } = getSheetRanges(
+    storeConfig.tab
   );
 
   const existingResponse = await sheets.spreadsheets.values.get(
     {
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: ORDER_NUMBER_RANGE,
+      range: orderNumberRange,
     },
     {
       timeout: REQUEST_TIMEOUT_MS,
@@ -584,32 +614,38 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
 
   if (alreadyExists) {
     console.log(
-      `${orderNumber} from ${storeConfig.name} is already in the sheet; skipping.`
+      `${orderNumber} from ${storeConfig.name} is already in the ${storeConfig.tab} tab; skipping.`
     );
     return;
   }
 
-  const total = Number(order.total_price);
+  // Shopify subtotal_price excludes taxes and shipping.
+  const subtotal = Number(order.subtotal_price);
 
-  if (!Number.isFinite(total) || total < 0) {
-    throw new Error(`Invalid total for ${orderNumber}.`);
+  if (!Number.isFinite(subtotal) || subtotal < 0) {
+    throw new Error(
+      `Invalid subtotal for ${orderNumber}.`
+    );
   }
 
-  const totalCents = Math.round(total * 100);
-  const tenPercentCents = Math.round(totalCents * 0.1);
+  const subtotalCents = Math.round(subtotal * 100);
+
+  const tenPercentCents = Math.round(
+    subtotalCents * 0.1
+  );
 
   const row = [
     getFulfillmentDate(order, triggeredAt),
     orderNumber,
     storeConfig.source,
-    totalCents / 100,
+    subtotalCents / 100,
     tenPercentCents / 100,
   ];
 
   await sheets.spreadsheets.values.append(
     {
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: SHEET_RANGE,
+      range: sheetRange,
       valueInputOption: "USER_ENTERED",
       insertDataOption: "INSERT_ROWS",
       requestBody: {
@@ -622,7 +658,7 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
   );
 
   console.log(
-    `Successfully added ${orderNumber} from ${storeConfig.name} to Google Sheets.`
+    `Successfully added ${orderNumber} from ${storeConfig.name} to the ${storeConfig.tab} tab.`
   );
 }
 
@@ -658,6 +694,7 @@ app.post(
       console.warn(
         `Rejected webhook from unrecognized Shopify store: ${shopDomain || "missing domain"}`
       );
+
       return res.status(401).send("Unexpected Shopify shop.");
     }
 
@@ -673,6 +710,7 @@ app.post(
       console.warn(
         `Rejected webhook: invalid HMAC signature for ${storeConfig.name}.`
       );
+
       return res.status(401).send("Invalid webhook signature.");
     }
 
@@ -700,7 +738,11 @@ app.post(
       await task;
       return res.status(200).send("Webhook processed.");
     } catch (error) {
-      console.error("Webhook processing failed:", error.message || error);
+      console.error(
+        "Webhook processing failed:",
+        error.message || error
+      );
+
       return res.status(500).send("Webhook processing failed.");
     }
   }
@@ -715,8 +757,8 @@ app.get("/", (req, res) => {
     [
       "Shopify fulfillment webhook receiver is running.",
       "",
-      "WONDER: Configured",
-      `NAYA: ${NAYA_SHOPIFY_ACCESS_TOKEN ? "Access token configured" : "OAuth token not configured"}`,
+      `WONDER: Configured (Google Sheets tab: ${GOOGLE_SHEET_TAB_WONDER})`,
+      `NAYA: ${NAYA_SHOPIFY_ACCESS_TOKEN ? "Access token configured" : "OAuth token not configured"} (Google Sheets tab: ${GOOGLE_SHEET_TAB_NAYA})`,
       "",
       "Webhook endpoint: /webhooks/orders-fulfilled",
     ].join("\n")
