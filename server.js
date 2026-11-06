@@ -99,7 +99,7 @@ function getSheetRanges(tabName) {
   const escapedTab = tabName.replace(/'/g, "''");
 
   return {
-    sheetRange: `'${escapedTab}'!A:E`,
+    sheetRange: `'${escapedTab}'!A:F`,
     orderNumberRange: `'${escapedTab}'!B:C`,
   };
 }
@@ -226,15 +226,17 @@ async function shopifyGraphQL(
 }
 
 // ============================================================
-// REGISTER FULFILLMENT WEBHOOK
+// REGISTER SHOPIFY WEBHOOK
 // ============================================================
 
-async function registerFulfillmentWebhook(
+async function registerShopifyWebhook(
   store,
   accessToken,
-  storeName
+  storeName,
+  topic,
+  topicLabel
 ) {
-  console.log(`Checking ${storeName} Shopify webhook registration...`);
+  console.log(`Checking ${storeName} ${topicLabel} webhook registration...`);
 
   const query = `
     query {
@@ -252,21 +254,19 @@ async function registerFulfillmentWebhook(
 
   const existing = data.webhookSubscriptions.nodes.find(
     (webhook) =>
-      webhook.topic === "ORDERS_FULFILLED" &&
+      webhook.topic === topic &&
       webhook.uri === WEBHOOK_URL
   );
 
   if (existing) {
     console.log(
-      `${storeName} fulfillment webhook already registered. ID: ${existing.id}`
+      `${storeName} ${topicLabel} webhook already registered. ID: ${existing.id}`
     );
     return;
   }
 
-  console.log(`Registering ${storeName} ORDERS_FULFILLED webhook...`);
-
   const mutation = `
-    mutation CreateFulfillmentWebhook(
+    mutation CreateShopifyWebhook(
       $topic: WebhookSubscriptionTopic!,
       $webhookSubscription: WebhookSubscriptionInput!
     ) {
@@ -292,7 +292,7 @@ async function registerFulfillmentWebhook(
     accessToken,
     mutation,
     {
-      topic: "ORDERS_FULFILLED",
+      topic,
       webhookSubscription: {
         uri: WEBHOOK_URL,
         format: "JSON",
@@ -305,12 +305,12 @@ async function registerFulfillmentWebhook(
 
   if (errors.length) {
     throw new Error(
-      `Could not register ${storeName} webhook: ${JSON.stringify(errors)}`
+      `Could not register ${storeName} ${topicLabel} webhook: ${JSON.stringify(errors)}`
     );
   }
 
   console.log(
-    `${storeName} webhook registered successfully. ID: ${
+    `${storeName} ${topicLabel} webhook registered successfully. ID: ${
       created.webhookSubscription?.id || "unknown"
     }`
   );
@@ -320,8 +320,30 @@ async function registerFulfillmentWebhook(
 // REGISTER STORE WEBHOOKS
 // ============================================================
 
+async function ensureStoreWebhooksRegistered(
+  store,
+  accessToken,
+  storeName
+) {
+  await registerShopifyWebhook(
+    store,
+    accessToken,
+    storeName,
+    "ORDERS_FULFILLED",
+    "fulfillment"
+  );
+
+  await registerShopifyWebhook(
+    store,
+    accessToken,
+    storeName,
+    "ORDERS_PAID",
+    "paid"
+  );
+}
+
 async function ensureWebhookRegistered() {
-  await registerFulfillmentWebhook(
+  await ensureStoreWebhooksRegistered(
     SHOPIFY_STORE,
     SHOPIFY_ACCESS_TOKEN,
     "WONDER"
@@ -336,7 +358,7 @@ async function ensureNayaWebhookRegistered() {
     return;
   }
 
-  await registerFulfillmentWebhook(
+  await ensureStoreWebhooksRegistered(
     NAYA_SHOPIFY_STORE,
     NAYA_SHOPIFY_ACCESS_TOKEN,
     "NAYA"
@@ -451,14 +473,14 @@ app.get("/auth/naya/callback", async (req, res) => {
     let registrationMessage;
 
     try {
-      await registerFulfillmentWebhook(
+      await ensureStoreWebhooksRegistered(
         NAYA_SHOPIFY_STORE,
         accessToken,
         "NAYA"
       );
 
       registrationMessage =
-        "NAYA fulfillment webhook registered successfully.";
+        "NAYA fulfillment and paid webhooks registered successfully.";
     } catch (error) {
       console.error(
         "NAYA webhook registration failed:",
@@ -569,6 +591,78 @@ function getFulfillmentDate(order, triggeredAt) {
 }
 
 // ============================================================
+// FIND ORDER IN GOOGLE SHEETS
+// ============================================================
+
+async function findOrderRow(orderNumber, storeConfig) {
+  const { orderNumberRange } = getSheetRanges(storeConfig.tab);
+
+  const response = await sheets.spreadsheets.values.get(
+    {
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: orderNumberRange,
+    },
+    {
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+
+  const rows = response.data.values || [];
+
+  const index = rows.findIndex(
+    (row) =>
+      String(row[0] || "").trim() === orderNumber &&
+      String(row[1] || "").trim().toLowerCase() ===
+        storeConfig.source.toLowerCase()
+  );
+
+  // Header is row 1, so the first data row is row 2.
+  return index === -1 ? null : index + 2;
+}
+
+// ============================================================
+// PROCESS PAID ORDER
+// ============================================================
+
+async function processPaidOrder(order, storeConfig) {
+  const orderNumber = String(order.name || "").trim();
+
+  if (!orderNumber) {
+    throw new Error("Paid webhook has no order number.");
+  }
+
+  const rowNumber = await findOrderRow(orderNumber, storeConfig);
+
+  if (!rowNumber) {
+    console.log(
+      `${orderNumber} is paid, but no matching row exists yet in ${storeConfig.tab}. The fulfillment webhook will add its current payment status.`
+    );
+    return;
+  }
+
+  const escapedTab = storeConfig.tab.replace(/'/g, "''");
+  const paidCell = `'${escapedTab}'!F${rowNumber}`;
+
+  await sheets.spreadsheets.values.update(
+    {
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: paidCell,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [["Paid"]],
+      },
+    },
+    {
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+
+  console.log(
+    `Marked ${orderNumber} as Paid in ${storeConfig.tab}, cell F${rowNumber}.`
+  );
+}
+
+// ============================================================
 // PROCESS FULFILLED ORDER
 // ============================================================
 
@@ -590,29 +684,11 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
     `Checking ${storeConfig.tab} spreadsheet tab for ${orderNumber} from ${storeConfig.name}...`
   );
 
-  // Use this store's own tab for both duplicate checking and appending.
-  const { sheetRange, orderNumberRange } = getSheetRanges(
-    storeConfig.tab
-  );
+  const { sheetRange } = getSheetRanges(storeConfig.tab);
 
-  const existingResponse = await sheets.spreadsheets.values.get(
-    {
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: orderNumberRange,
-    },
-    {
-      timeout: REQUEST_TIMEOUT_MS,
-    }
-  );
+  const existingRow = await findOrderRow(orderNumber, storeConfig);
 
-  const alreadyExists = (existingResponse.data.values || []).some(
-    (row) =>
-      String(row[0] || "").trim() === orderNumber &&
-      String(row[1] || "").trim().toLowerCase() ===
-        storeConfig.source.toLowerCase()
-  );
-
-  if (alreadyExists) {
+  if (existingRow) {
     console.log(
       `${orderNumber} from ${storeConfig.name} is already in the ${storeConfig.tab} tab; skipping.`
     );
@@ -623,16 +699,11 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
   const subtotal = Number(order.subtotal_price);
 
   if (!Number.isFinite(subtotal) || subtotal < 0) {
-    throw new Error(
-      `Invalid subtotal for ${orderNumber}.`
-    );
+    throw new Error(`Invalid subtotal for ${orderNumber}.`);
   }
 
   const subtotalCents = Math.round(subtotal * 100);
-
-  const tenPercentCents = Math.round(
-    subtotalCents * 0.1
-  );
+  const tenPercentCents = Math.round(subtotalCents * 0.1);
 
   const row = [
     getFulfillmentDate(order, triggeredAt),
@@ -640,6 +711,9 @@ async function processFulfilledOrder(order, triggeredAt, storeConfig) {
     storeConfig.source,
     subtotalCents / 100,
     tenPercentCents / 100,
+    String(order.financial_status || "").toLowerCase() === "paid"
+      ? "Paid"
+      : "",
   ];
 
   await sheets.spreadsheets.values.append(
@@ -686,7 +760,12 @@ app.post(
 
     const webhookId = req.get("X-Shopify-Webhook-Id");
 
-    if (topic !== "orders/fulfilled") {
+    const supportedTopics = [
+      "orders/fulfilled",
+      "orders/paid",
+    ];
+
+    if (!supportedTopics.includes(topic)) {
       return res.status(400).send("Unexpected webhook topic.");
     }
 
@@ -723,14 +802,18 @@ app.post(
     }
 
     console.log(
-      `Received orders/fulfilled webhook from ${storeConfig.name}. Delivery ID: ${webhookId || "not provided"}`
+      `Received ${topic} webhook from ${storeConfig.name}. Delivery ID: ${webhookId || "not provided"}`
     );
 
     const triggeredAt = req.get("X-Shopify-Triggered-At");
 
-    const task = webhookProcessing.then(() =>
-      processFulfilledOrder(order, triggeredAt, storeConfig)
-    );
+    const task = webhookProcessing.then(() => {
+      if (topic === "orders/paid") {
+        return processPaidOrder(order, storeConfig);
+      }
+
+      return processFulfilledOrder(order, triggeredAt, storeConfig);
+    });
 
     webhookProcessing = task.catch(() => {});
 
@@ -760,7 +843,7 @@ app.get("/", (req, res) => {
       `WONDER: Configured (Google Sheets tab: ${GOOGLE_SHEET_TAB_WONDER})`,
       `NAYA: ${NAYA_SHOPIFY_ACCESS_TOKEN ? "Access token configured" : "OAuth token not configured"} (Google Sheets tab: ${GOOGLE_SHEET_TAB_NAYA})`,
       "",
-      "Webhook endpoint: /webhooks/orders-fulfilled",
+      "Webhook endpoint (fulfillment and payment): /webhooks/orders-fulfilled",
     ].join("\n")
   );
 });
@@ -771,7 +854,9 @@ app.get("/", (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Shopify webhook app running on port ${PORT}`);
-  console.log("Configured webhook stores: WONDER and NAYA.");
+  console.log(
+    "Configured webhook stores: WONDER and NAYA (fulfillment and paid events)."
+  );
 
   ensureWebhookRegistered().catch((error) => {
     console.error(
