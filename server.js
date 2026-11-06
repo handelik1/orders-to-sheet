@@ -595,7 +595,10 @@ function getFulfillmentDate(order, triggeredAt) {
 // ============================================================
 
 async function findOrderRow(orderNumber, storeConfig) {
-  const { orderNumberRange } = getSheetRanges(storeConfig.tab);
+  const escapedTab = storeConfig.tab.replace(/'/g, "''");
+
+  // Start at row 2 to exclude the header.
+  const orderNumberRange = `'${escapedTab}'!B2:C`;
 
   const response = await sheets.spreadsheets.values.get(
     {
@@ -616,10 +619,9 @@ async function findOrderRow(orderNumber, storeConfig) {
         storeConfig.source.toLowerCase()
   );
 
-  // Header is row 1, so the first data row is row 2.
+  // B2 is array index 0, so index + 2 is the actual sheet row.
   return index === -1 ? null : index + 2;
 }
-
 // ============================================================
 // PROCESS PAID ORDER
 // ============================================================
