@@ -24,10 +24,10 @@ const NAYA_SHOPIFY_ACCESS_TOKEN = process.env.NAYA_SHOPIFY_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = "2026-10";
 
 const WEBHOOK_URL =
-  "https://orders-to-sheet.onrender.com/webhooks/orders-fulfilled";
+  "https://orders-to-sheet-r1nm.onrender.com/webhooks/orders-fulfilled";
 
 const NAYA_REDIRECT_URI =
-  "https://orders-to-sheet.onrender.com/auth/naya/callback";
+  "https://orders-to-sheet-r1nm.onrender.com/auth/naya/callback";
 
 const REQUEST_TIMEOUT_MS = 20000;
 
